@@ -42,6 +42,8 @@
 
 #include <openssl/x509.h>
 
+#include <ctype.h>
+
 #if !_WIN32
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -692,9 +694,10 @@ static X509 *rd_kafka_ssl_X509_from_string (rd_kafka_t *rk, const char *str) {
 #ifdef _WIN32
 
 /**
- * @brief Attempt load CA certificates from the Windows Certificate Root store.
+ * @brief Attempt load CA certificates from a Windows Certificate store.
  */
-static int rd_kafka_ssl_win_load_root_certs (rd_kafka_t *rk, SSL_CTX *ctx) {
+static int rd_kafka_ssl_win_load_cert_store (rd_kafka_t *rk, SSL_CTX *ctx,
+                                             const char *store_name) {
         HCERTSTORE w_store;
         PCCERT_CONTEXT w_cctx = NULL;
         X509_STORE *store;
@@ -705,12 +708,13 @@ static int rd_kafka_ssl_win_load_root_certs (rd_kafka_t *rk, SSL_CTX *ctx) {
                                 0,
                                 0,
                                 CERT_SYSTEM_STORE_CURRENT_USER,
-                                L"Root");
+                                store_name);
         if (!w_store) {
-                rd_kafka_dbg(rk, SECURITY, "CERTROOT",
+                rd_kafka_log(rk, LOG_ERR, "CERTROOT",
                              "Failed to open Windows certificate "
-                             "Root store: %s: "
+                             "%s store: %s: "
                              "falling back to OpenSSL default CA paths",
+                             store_name,
                              rd_strerror_w32(GetLastError(), errstr,
                                              sizeof(errstr)));
                 return -1;
@@ -748,12 +752,57 @@ static int rd_kafka_ssl_win_load_root_certs (rd_kafka_t *rk, SSL_CTX *ctx) {
 
         rd_kafka_dbg(rk, SECURITY, "CERTROOT",
                      "%d/%d certificate(s) successfully added from "
-                     "Windows Certificate Root store",
-                     cnt - fail_cnt, cnt);
+                     "Windows Certificate %s store",
+                     cnt - fail_cnt, cnt, store_name);
 
         return cnt - fail_cnt == 0 ? -1 : 0;
 }
+
+/**
+ * @brief Load certs from the configured CSV list of Windows Cert stores.
+ *
+ * @returns 0 on success or -1 on error.
+ */
+static int rd_kafka_ssl_win_load_cert_stores (rd_kafka_t *rk,
+                                              SSL_CTX *ctx,
+                                              const char *store_names) {
+        char *s;
+
+        if (!store_names || !*store_names)
+                return 0;
+
+        rd_strdupa(&s, store_names);
+
+        while (*s) {
+                char *t;
+                const char *store_name;
+
+                while (isspace((int)*s) || *s == ',')
+                        s++;
+
+                if (!*s)
+                        break;
+
+                store_name = s;
+
+                t = strchr(s, (int)',');
+                if (t) {
+                        *t = '\0';
+                        s = t+1;
+                        for (; t >= store_name && isspace((int)*t) ; t--)
+                                     *t = '\0';
+                } else {
+                        s = "";
+                }
+
+                if (rd_kafka_ssl_win_load_cert_store(rk, ctx, store_name) != 0)
+                        return -1;
+        }
+
+        return 0;
+}
 #endif /* MSC_VER */
+
 
 
 /**
@@ -908,8 +957,9 @@ static int rd_kafka_ssl_set_certs (rd_kafka_t *rk, SSL_CTX *ctx,
         } else {
 #ifdef _WIN32
                 /* Attempt to load CA root certificates from the
-                 * Windows crypto Root cert store. */
-                r = rd_kafka_ssl_win_load_root_certs(rk, ctx);
+                 * configured Windows certificate stores. */
+                r = rd_kafka_ssl_win_load_cert_stores(
+                        rk, ctx, rk->rk_conf.ssl.ca_cert_stores);
 #else
                 r = -1;
 #endif
